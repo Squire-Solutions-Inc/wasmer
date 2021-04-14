@@ -1,3 +1,7 @@
+MODIFIED TO COMPILE/RUN ON ANDROID
+SEE: https://github.com/wasmerio/wasmer/compare/master...igrep:android-test?expand=1
+
+
 <div align="center">
   <a href="https://wasmer.io" target="_blank" rel="noopener noreferrer">
     <img width="300" src="https://raw.githubusercontent.com/wasmerio/wasmer/master/assets/logo.png" alt="Wasmer logo">
