@@ -35,6 +35,8 @@
 //!   }
 //!   ```
 
+#![allow(missing_docs)] // For some reason lint fails saying that `LibCall` is not documented, when it actually is
+
 use crate::func_data_registry::VMFuncRef;
 use crate::probestack::PROBESTACK;
 use crate::table::{RawTableElement, TableElement};
@@ -42,6 +44,8 @@ use crate::trap::{raise_lib_trap, Trap, TrapCode};
 use crate::vmcontext::VMContext;
 use crate::VMExternRef;
 use loupe::MemoryUsage;
+#[cfg(feature = "enable-rkyv")]
+use rkyv::{Archive, Deserialize as RkyvDeserialize, Serialize as RkyvSerialize};
 use serde::{Deserialize, Serialize};
 use std::fmt;
 use wasmer_types::{
@@ -335,7 +339,7 @@ pub unsafe extern "C" fn wasmer_vm_table_get(
     // TODO: type checking, maybe have specialized accessors
     match instance.table_get(table_index, elem_index) {
         Some(table_ref) => table_ref.into(),
-        None => raise_lib_trap(Trap::new_from_runtime(TrapCode::TableAccessOutOfBounds)),
+        None => raise_lib_trap(Trap::lib(TrapCode::TableAccessOutOfBounds)),
     }
 }
 
@@ -356,7 +360,7 @@ pub unsafe extern "C" fn wasmer_vm_imported_table_get(
     // TODO: type checking, maybe have specialized accessors
     match instance.imported_table_get(table_index, elem_index) {
         Some(table_ref) => table_ref.into(),
-        None => raise_lib_trap(Trap::new_from_runtime(TrapCode::TableAccessOutOfBounds)),
+        None => raise_lib_trap(Trap::lib(TrapCode::TableAccessOutOfBounds)),
     }
 }
 
@@ -664,7 +668,7 @@ pub unsafe extern "C" fn wasmer_vm_data_drop(vmctx: *mut VMContext, data_index: 
 /// `wasmer_call_trampoline` must have been previously called.
 #[no_mangle]
 pub unsafe extern "C" fn wasmer_vm_raise_trap(trap_code: TrapCode) -> ! {
-    let trap = Trap::new_from_runtime(trap_code);
+    let trap = Trap::lib(trap_code);
     raise_lib_trap(trap)
 }
 
@@ -680,6 +684,10 @@ pub static wasmer_vm_probestack: unsafe extern "C" fn() = PROBESTACK;
 /// The name of a runtime library routine.
 ///
 /// This list is likely to grow over time.
+#[cfg_attr(
+    feature = "enable-rkyv",
+    derive(RkyvSerialize, RkyvDeserialize, Archive)
+)]
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, MemoryUsage)]
 pub enum LibCall {
     /// ceil.f32

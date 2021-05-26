@@ -13,13 +13,13 @@ mod r#ref;
 pub use allocator::InstanceAllocator;
 pub use r#ref::InstanceRef;
 
-use crate::export::VMExport;
+use crate::export::VMExtern;
 use crate::func_data_registry::{FuncDataRegistry, VMFuncRef};
 use crate::global::Global;
 use crate::imports::Imports;
 use crate::memory::{Memory, MemoryError};
 use crate::table::{Table, TableElement};
-use crate::trap::{catch_traps, init_traps, Trap, TrapCode};
+use crate::trap::{catch_traps, Trap, TrapCode, TrapHandler};
 use crate::vmcontext::{
     VMBuiltinFunctionsArray, VMCallerCheckedAnyfunc, VMContext, VMFunctionBody,
     VMFunctionEnvironment, VMFunctionImport, VMFunctionKind, VMGlobalDefinition, VMGlobalImport,
@@ -27,12 +27,12 @@ use crate::vmcontext::{
     VMTrampoline,
 };
 use crate::{FunctionBodyPtr, ModuleInfo, VMOffsets};
-use crate::{VMExportFunction, VMExportGlobal, VMExportMemory, VMExportTable};
+use crate::{VMFunction, VMGlobal, VMMemory, VMTable};
 use loupe::{MemoryUsage, MemoryUsageTracker};
 use memoffset::offset_of;
 use more_asserts::assert_lt;
 use std::any::Any;
-use std::cell::{Cell, RefCell};
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::convert::{TryFrom, TryInto};
 use std::ffi;
@@ -97,10 +97,6 @@ pub(crate) struct Instance {
 
     /// Hosts can store arbitrary per-instance information here.
     host_state: Box<dyn Any>,
-
-    /// Handler run when `SIGBUS`, `SIGFPE`, `SIGILL`, or `SIGSEGV` are caught by the instance thread.
-    #[loupe(skip)]
-    pub(crate) signal_handler: Cell<Option<Box<SignalHandler>>>,
 
     /// Functions to operate on host environments in the imports
     /// and pointers to the environments.
@@ -397,7 +393,7 @@ impl Instance {
     }
 
     /// Invoke the WebAssembly start function of the instance, if one is present.
-    fn invoke_start_function(&self) -> Result<(), Trap> {
+    fn invoke_start_function(&self, trap_handler: &dyn TrapHandler) -> Result<(), Trap> {
         let start_index = match self.module.start_function {
             Some(idx) => idx,
             None => return Ok(()),
@@ -426,7 +422,7 @@ impl Instance {
 
         // Make the call.
         unsafe {
-            catch_traps(callee_vmctx, || {
+            catch_traps(trap_handler, || {
                 mem::transmute::<*const VMFunctionBody, unsafe extern "C" fn(VMFunctionEnvironment)>(
                     callee_address,
                 )(callee_vmctx)
@@ -669,7 +665,7 @@ impl Instance {
             .map_or(true, |n| n as usize > elem.len())
             || dst.checked_add(len).map_or(true, |m| m > table.size())
         {
-            return Err(Trap::new_from_runtime(TrapCode::TableAccessOutOfBounds));
+            return Err(Trap::lib(TrapCode::TableAccessOutOfBounds));
         }
 
         for (dst, src) in (dst..dst + len).zip(src..src + len) {
@@ -702,7 +698,7 @@ impl Instance {
             .checked_add(len)
             .map_or(true, |n| n as usize > table_size)
         {
-            return Err(Trap::new_from_runtime(TrapCode::TableAccessOutOfBounds));
+            return Err(Trap::lib(TrapCode::TableAccessOutOfBounds));
         }
 
         for i in start_index..(start_index + len) {
@@ -821,7 +817,7 @@ impl Instance {
                 .checked_add(len)
                 .map_or(true, |m| m > memory.current_length)
         {
-            return Err(Trap::new_from_runtime(TrapCode::HeapAccessOutOfBounds));
+            return Err(Trap::lib(TrapCode::HeapAccessOutOfBounds));
         }
 
         let src_slice = &data[src as usize..(src + len) as usize];
@@ -935,7 +931,6 @@ impl InstanceHandle {
                 passive_data,
                 host_state,
                 funcrefs,
-                signal_handler: Cell::new(None),
                 imported_function_envs,
                 vmctx: VMContext {},
             };
@@ -944,7 +939,7 @@ impl InstanceHandle {
 
             // Set the funcrefs after we've built the instance
             {
-                let instance = instance_ref.as_mut();
+                let instance = instance_ref.as_mut().unwrap();
                 let vmctx_ptr = instance.vmctx_ptr();
                 instance.funcrefs = build_funcrefs(
                     &*instance.module,
@@ -1000,9 +995,6 @@ impl InstanceHandle {
             VMBuiltinFunctionsArray::initialized(),
         );
 
-        // Ensure that our signal handlers are ready for action.
-        init_traps();
-
         // Perform infallible initialization in this constructor, while fallible
         // initialization is deferred to the `initialize` method.
         initialize_passive_elements(instance);
@@ -1023,11 +1015,10 @@ impl InstanceHandle {
     /// Only safe to call immediately after instantiation.
     pub unsafe fn finish_instantiation(
         &self,
+        trap_handler: &dyn TrapHandler,
         data_initializers: &[DataInitializer<'_>],
     ) -> Result<(), Trap> {
         let instance = self.instance().as_ref();
-        check_table_init_bounds(instance)?;
-        check_memory_init_bounds(instance, data_initializers)?;
 
         // Apply the initializers.
         initialize_tables(instance)?;
@@ -1035,7 +1026,7 @@ impl InstanceHandle {
 
         // The WebAssembly spec specifies that the start function is
         // invoked automatically at instantiation time.
-        instance.invoke_start_function()?;
+        instance.invoke_start_function(trap_handler)?;
         Ok(())
     }
 
@@ -1067,7 +1058,7 @@ impl InstanceHandle {
     }
 
     /// Lookup an export with the given name.
-    pub fn lookup(&self, field: &str) -> Option<VMExport> {
+    pub fn lookup(&self, field: &str) -> Option<VMExtern> {
         let export = self.module_ref().exports.get(field)?;
 
         Some(self.lookup_by_declaration(&export))
@@ -1075,7 +1066,7 @@ impl InstanceHandle {
 
     /// Lookup an export with the given export declaration.
     // TODO: maybe EngineExport
-    pub fn lookup_by_declaration(&self, export: &ExportIndex) -> VMExport {
+    pub fn lookup_by_declaration(&self, export: &ExportIndex) -> VMExtern {
         let instance = self.instance().clone();
         let instance_ref = instance.as_ref();
 
@@ -1099,7 +1090,7 @@ impl InstanceHandle {
                 let call_trampoline = Some(instance_ref.function_call_trampolines[*sig_index]);
                 let signature = instance_ref.module.signatures[*sig_index].clone();
 
-                VMExportFunction {
+                VMFunction {
                     address,
                     // Any function received is already static at this point as:
                     // 1. All locally defined functions in the Wasm have a static signature.
@@ -1120,7 +1111,7 @@ impl InstanceHandle {
                     let import = instance_ref.imported_table(*index);
                     import.from.clone()
                 };
-                VMExportTable {
+                VMTable {
                     from,
                     instance_ref: Some(instance),
                 }
@@ -1133,7 +1124,7 @@ impl InstanceHandle {
                     let import = instance_ref.imported_memory(*index);
                     import.from.clone()
                 };
-                VMExportMemory {
+                VMMemory {
                     from,
                     instance_ref: Some(instance),
                 }
@@ -1148,7 +1139,7 @@ impl InstanceHandle {
                         import.from.clone()
                     }
                 };
-                VMExportGlobal {
+                VMGlobal {
                     from,
                     instance_ref: Some(instance),
                 }
@@ -1246,7 +1237,7 @@ impl InstanceHandle {
         &mut self,
         instance_ptr: *const ffi::c_void,
     ) -> Result<(), Err> {
-        let instance_ref = self.instance.as_mut();
+        let instance_ref = self.instance.as_mut_unchecked();
 
         for import_function_env in instance_ref.imported_function_envs.values_mut() {
             match import_function_env {
@@ -1270,49 +1261,6 @@ impl InstanceHandle {
         }
         Ok(())
     }
-}
-
-cfg_if::cfg_if! {
-    if #[cfg(unix)] {
-        pub type SignalHandler = dyn Fn(libc::c_int, *const libc::siginfo_t, *const libc::c_void) -> bool;
-
-        impl InstanceHandle {
-            /// Set a custom signal handler
-            pub fn set_signal_handler<H>(&self, handler: H)
-            where
-                H: 'static + Fn(libc::c_int, *const libc::siginfo_t, *const libc::c_void) -> bool,
-            {
-                self.instance().as_ref().signal_handler.set(Some(Box::new(handler)));
-            }
-        }
-    } else if #[cfg(target_os = "windows")] {
-        pub type SignalHandler = dyn Fn(winapi::um::winnt::PEXCEPTION_POINTERS) -> bool;
-
-        impl InstanceHandle {
-            /// Set a custom signal handler
-            pub fn set_signal_handler<H>(&self, handler: H)
-            where
-                H: 'static + Fn(winapi::um::winnt::PEXCEPTION_POINTERS) -> bool,
-            {
-                self.instance().as_ref().signal_handler.set(Some(Box::new(handler)));
-            }
-        }
-    }
-}
-
-fn check_table_init_bounds(instance: &Instance) -> Result<(), Trap> {
-    let module = Arc::clone(&instance.module);
-    for init in &module.table_initializers {
-        let start = get_table_init_start(init, instance);
-        let table = instance.get_table(init.table_index);
-
-        let size = usize::try_from(table.size()).unwrap();
-        if size < start + init.elements.len() {
-            return Err(Trap::new_from_runtime(TrapCode::TableSetterOutOfBounds));
-        }
-    }
-
-    Ok(())
 }
 
 /// Compute the offset for a memory data initializer.
@@ -1351,23 +1299,6 @@ unsafe fn get_memory_slice<'instance>(
     slice::from_raw_parts_mut(memory.base, memory.current_length.try_into().unwrap())
 }
 
-fn check_memory_init_bounds(
-    instance: &Instance,
-    data_initializers: &[DataInitializer<'_>],
-) -> Result<(), Trap> {
-    for init in data_initializers {
-        let start = get_memory_init_start(init, instance);
-        unsafe {
-            let mem_slice = get_memory_slice(init, instance);
-            if mem_slice.get_mut(start..start + init.data.len()).is_none() {
-                return Err(Trap::new_from_runtime(TrapCode::HeapSetterOutOfBounds));
-            }
-        }
-    }
-
-    Ok(())
-}
-
 /// Compute the offset for a table element initializer.
 fn get_table_init_start(init: &TableInitializer, instance: &Instance) -> usize {
     let mut start = init.offset;
@@ -1397,7 +1328,7 @@ fn initialize_tables(instance: &Instance) -> Result<(), Trap> {
             .checked_add(init.elements.len())
             .map_or(true, |end| end > table.size() as usize)
         {
-            return Err(Trap::new_from_runtime(TrapCode::TableAccessOutOfBounds));
+            return Err(Trap::lib(TrapCode::TableAccessOutOfBounds));
         }
 
         for (i, func_idx) in init.elements.iter().enumerate() {
@@ -1455,7 +1386,7 @@ fn initialize_memories(
             .checked_add(init.data.len())
             .map_or(true, |end| end > memory.current_length.try_into().unwrap())
         {
-            return Err(Trap::new_from_runtime(TrapCode::HeapAccessOutOfBounds));
+            return Err(Trap::lib(TrapCode::HeapAccessOutOfBounds));
         }
 
         unsafe {
